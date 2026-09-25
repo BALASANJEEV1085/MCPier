@@ -1,4 +1,4 @@
-name: Production Deploy
+name: Build and Deploy MCPier to EC2
 
 on:
   push:
@@ -10,15 +10,13 @@ env:
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: mcpier
   INSTANCE_ID: i-02ada14feb47b555c
-  PUBLIC_URL: http://3.6.254.170
-  SECRETS_ID: deptic/MCPier/secrets
   CONTAINER_PORT: 80
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -26,65 +24,42 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install backend dependencies
-        working-directory: backend
-        run: |
-          pip install hatchling
-          pip install -e .
-
-      - name: Build backend wheel
-        working-directory: backend
-        run: |
-          python -m build --wheel
-          mkdir -p ../app
-          cp dist/*.whl ../app/
-
-      - name: Set up Node
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
-        env:
-          NEXT_PUBLIC_API_URL: ${{ env.PUBLIC_URL }}
-
-      - name: Copy frontend to app bundle
+      - name: Build backend diagnostics
         run: |
-          mkdir -p app/static
-          cp -r frontend/out/* app/static/ 2>/dev/null || cp -r frontend/.next app/static/ 2>/dev/null || true
+          cd backend
+          pip install -e .
+          python -c "from src.main import app; print('Backend app loaded successfully')"
+
+      - name: Build frontend diagnostics
+        run: |
+          cd frontend
+          npm ci
+          npm run build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Build, tag, and push Docker image to ECR
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          IMAGE_TAG="${{ github.sha }}"
+          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
+          docker build -t "$FULL_IMAGE" -f Dockerfile .
+          # Use direct AWS CLI to login
+          aws ecr get-login-password --region "${{ env.REGION }}" | docker login --username AWS --password-stdin "${{ env.ECR_REGISTRY }}"
+          docker push "$FULL_IMAGE"
+          echo "IMAGE_URI=$FULL_IMAGE" >> $GITHUB_ENV
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-      - name: Configure AWS credentials
+      - name: Deploy via SSM on EC2
         run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws configure set region $REGION
-
-      - name: Login to ECR
-        run: |
-          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
-
-      - name: Push Docker image
-        run: |
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-      - name: Deploy to EC2 via SSM
-        run: |
-          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
-
+          # Write SSM parameters to file to avoid shell escaping issues
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
@@ -92,63 +67,56 @@ jobs:
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p ${CONTAINER_PORT}:80 --name app $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
             ]
           }
           SSMPARAMS
-
-          # Replace variables in the JSON commands
-          sed -i "s|\$REGION|$REGION|g; s|\$ECR_REGISTRY|$ECR_REGISTRY|g; s|\$IMAGE_URI|$IMAGE_URI|g; s|\$CONTAINER_PORT|$CONTAINER_PORT|g" /tmp/ssm-params.json
-
+          # Substitute variables in the JSON (not shell-expanded inside the heredoc)
+          sed -i "s|\$REGION|${{ env.REGION }}|g; s|\$ECR_REGISTRY|${{ env.ECR_REGISTRY }}|g; s|\$IMAGE_URI|${{ env.IMAGE_URI }}|g" /tmp/ssm-params.json
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --region "$REGION" \
+            --instance-ids "${{ env.INSTANCE_ID }}" \
+            --region "${{ env.REGION }}" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" \
             --output text)
-
-          echo "SSM Command ID: $COMMAND_ID"
-
-          # Wait for command to complete (up to 5 minutes)
+          echo "SSM command ID: $COMMAND_ID"
+          # Wait for command to complete
           for i in $(seq 1 30); do
             STATUS=$(aws ssm list-command-invocations \
               --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --details \
-              --region "$REGION" \
+              --instance-id "${{ env.INSTANCE_ID }}" \
+              --region "${{ env.REGION }}" \
               --query "CommandInvocations[0].Status" \
               --output text)
             if [ "$STATUS" = "Success" ]; then
               echo "Deployment completed successfully"
               break
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
               echo "Deployment failed with status: $STATUS"
-              # Print stderr from the command
-              aws ssm list-command-invocations \
+              # Get error output
+              aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --details \
-                --region "$REGION" \
-                --query "CommandInvocations[0].CommandPlugins[0].Output" \
-                --output text
+                --instance-id "${{ env.INSTANCE_ID }}" \
+                --region "${{ env.REGION }}" \
+                --query "StandardErrorContent" --output text
               exit 1
             fi
-            echo "Waiting... attempt $i/30"
             sleep 10
           done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Health check
         run: |
-          echo "Waiting for service to be ready..."
-          for i in $(seq 1 12); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/api/health" || echo "000")
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed (HTTP 200)"
-              exit 0
-            fi
-            echo "Health check attempt $i/12 returned $HTTP_CODE"
-            sleep 5
-          done
-          echo "Health check failed after 12 attempts"
-          exit 1
+          echo "Waiting for application to start..."
+          sleep 15
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://3.6.254.170/ || true)
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Health check failed: received HTTP status $HTTP_STATUS"
+            curl -v http://3.6.254.170/ || true
+            exit 1
+          fi
+          echo "Health check passed: HTTP 200 OK"
+          echo "Application is reachable at: http://3.6.254.170"
