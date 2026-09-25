@@ -1,5 +1,4 @@
----
-name: Deploy MCPier to EC2 (Docker)
+name: Deploy MCPier Backend to EC2
 
 on:
   push:
@@ -13,132 +12,136 @@ env:
   INSTANCE_ID: i-02ada14feb47b555c
   PUBLIC_URL: http://3.6.254.170
   CONTAINER_PORT: 80
-  SECRETS_MANAGER_ID: deptic/MCPier/secrets
+  SECRETS_ID: deptic/MCPier/secrets
 
 jobs:
   build-and-deploy:
-    name: Build, push, and deploy
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: pip install . hatchling
+
+      - name: Backend syntax check
+        working-directory: ./backend
+        run: python -c "import ast; ast.parse(open('src/main.py').read()); print('Backend AST OK')"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: ./frontend
+        run: npm run build
+
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
-        run: |
-          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::7}"
-          echo "FULL_IMAGE=$IMAGE_URI" >> "$GITHUB_ENV"
-          docker build -t "$IMAGE_URI" -f Dockerfile .
-
-      - name: Run build diagnostics
-        run: |
-          docker inspect "$FULL_IMAGE" --format='{{.Size}}' | xargs -I{} echo "Image size: {} bytes"
-          docker run --rm "$FULL_IMAGE" python -c "from src.main import app; print('Import OK')" || \
-            docker run --rm "$FULL_IMAGE" sh -c "python -c 'print(\"Python OK\")'"
-
-      - name: Install AWS CLI
-        run: |
-          curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
-          unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install --update
 
       - name: Configure AWS credentials
         run: |
           mkdir -p ~/.aws
-          cat > ~/.aws/credentials << 'AWS_CREDS'
+          cat > ~/.aws/credentials << 'EOF'
           [default]
           aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_CREDS
-          cat > ~/.aws/config << 'AWS_CONF'
+          EOF
+          cat > ~/.aws/config << 'EOF'
           [default]
           region = ${{ env.AWS_REGION }}
           output = json
-          AWS_CONF
+          EOF
 
-      - name: Push Docker image to ECR
+      - name: Log in to Amazon ECR
         run: |
-          aws ecr get-login-password --region "$AWS_REGION" | \
-            docker login --username AWS --password-stdin "$ECR_REGISTRY"
-          docker push "$FULL_IMAGE"
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
 
-      - name: Retrieve secrets and write .env on EC2
+      - name: Build and push Docker image
         run: |
-          SECRETS_JSON=$(aws secretsmanager get-secret-value \
-            --secret-id "$SECRETS_MANAGER_ID" \
-            --region "$AWS_REGION" \
-            --query SecretString --output text)
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker build -t $IMAGE_URI -f Dockerfile .
+          docker push $IMAGE_URI
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-          # Build .env file content from secrets
-          cat > /tmp/dotenv.txt << 'DOSEP'
-          DATABASE_URL=$(echo "$SECRETS_JSON" | jq -r '.DATABASE_URL // ""')
-          SECRET_KEY=$(echo "$SECRETS_JSON" | jq -r '.SECRET_KEY // ""')
-          CORS_ORIGINS=$(echo "$SECRETS_JSON" | jq -r '.CORS_ORIGINS // ""')
-          DOSEP
-
-          # Build SSM file to copy .env to EC2 then run container
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
-          {
-            "commands": [
-              "apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1",
-              "mkdir -p /home/ubuntu/app",
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI"
-            ]
-          }
-          SSMPARAMS
-
-          # Write .env then deploy
-          cat > /tmp/ssm-put-env.json << 'SSMENV'
-          {
-            "commands": [
-              "aws ssm get-parameter --name \"/deptic/MCPier/secrets\" --with-decryption --region $REGION --query Parameter.Value --output text | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'{k}={v}') for k,v in d.items()]\" > /home/ubuntu/app/.env"            ]
-          }
-          SSMENV
-
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-put-env.json \
-            --query "Command.CommandId" --output text)
-          echo "SECRETS_CMD_ID=$COMMAND_ID" >> "$GITHUB_ENV"
-          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION"
-
-      - name: Deploy container on EC2 via SSM
+      - name: Download secrets from AWS Secrets Manager
         run: |
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::7}"
+          SECRETS=$(aws secretsmanager get-secret-value --secret-id ${{ env.SECRETS_ID }} --query SecretString --output text)
+          echo "$SECRETS" > /tmp/secrets.env
+          echo "Secrets fetched successfully"
+
+      - name: Send SSM command to deploy on EC2
+        run: |
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
+          REGION="${{ env.AWS_REGION }}"
+          ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
+          ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
+          IMAGE_TAG="${{ github.sha }}"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          CONTAINER_PORT="${{ env.CONTAINER_PORT }}"
+
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $FULL_IMAGE",
-              "docker stop app || true",
-              "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app --env-file /home/ubuntu/app/.env $FULL_IMAGE"
+              "docker pull $IMAGE_URI",
+              "docker stop app 2>/dev/null || true",
+              "docker rm app 2>/dev/null || true",
+              "docker run -d --restart always --name app -p $CONTAINER_PORT:$CONTAINER_PORT $IMAGE_URI"
             ]
           }
           SSMPARAMS
-          sed -i "s|\$FULL_IMAGE|${FULL_IMAGE}|g; s|\$REGION|${AWS_REGION}|g; s|\$ECR_REGISTRY|${ECR_REGISTRY}|g" /tmp/ssm-params.json
+
+          echo "Sending deploy command to EC2 instance $INSTANCE_ID..."
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
+            --region "$REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
-          echo "DEPLOY_CMD_ID=$COMMAND_ID" >> "$GITHUB_ENV"
-          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION"
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Command ID: $COMMAND_ID"
+
+          echo "Waiting for command to complete..."
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$REGION"
+
+          echo "Deploy command completed. Checking output..."
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$REGION" \
+            --query "Status" --output text
 
       - name: Health check
         run: |
-          sleep 10
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$PUBLIC_URL/api/health" 2>/dev/null || echo "000")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Health check failed — HTTP $HTTP_CODE"
-            curl -v --max-time 10 "$PUBLIC_URL/api/health" 2>&1 | tail -20
-            exit 1
-          fi
-          echo "Health check OK — HTTP 200"
-          curl -s "$PUBLIC_URL/api/health" | python3 -m json.tool
+          echo "Waiting for service to be ready..."
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.PUBLIC_URL }}/api/health || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Service is healthy (HTTP 200)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP status $HTTP_CODE, retrying in 10 seconds..."
+            sleep 10
+          done
+          echo "Health check failed after 12 attempts"
+          exit 1
