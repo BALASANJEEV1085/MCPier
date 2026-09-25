@@ -1,0 +1,176 @@
+name: Build and Deploy McPier Backend to EC2 Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGION: ap-south-1
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: mcpier
+  INSTANCE_ID: i-02ada14feb47b555c
+  PUBLIC_URL: http://3.6.254.170
+  SECRETS_MANAGER_ID: deptic/MCPier/secrets
+  CONTAINER_PORT: 8300
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build application diagnostics
+        run: |
+          cd backend
+          echo "=== Python version ==="
+          python --version
+          echo "=== Files present ==="
+          ls -la
+          echo "=== pyproject.toml ==="
+          cat pyproject.toml
+          echo "=== main.py exists ==="
+          test -f main.py && echo "YES" || echo "NO"
+          echo "=== src/main.py exists ==="
+          test -f src/main.py && echo "YES" || echo "NO"
+
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials << 'EOF'
+          [default]
+          aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EOF
+          cat > ~/.aws/config << 'EOF'
+          [default]
+          region = ap-south-1
+          output = json
+          EOF
+
+      - name: Create Dockerfile
+        run: |
+          cat > Dockerfile << 'DOCKERFILE'
+          FROM python:3.11-slim
+          WORKDIR /app
+          RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+              rm -rf /var/lib/apt/lists/*
+          RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+          ENV PATH="/root/.local/bin:$PATH"
+          COPY backend/ .
+          RUN uv sync --no-dev
+          EXPOSE 8300
+          CMD ["uv", "run", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8300"]
+          DOCKERFILE
+
+      - name: Build and tag Docker image
+        run: |
+          TAG="${{ github.sha }}"
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$TAG .
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$TAG ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Authenticate Docker to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.REGION }} | \
+            docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Fetch secrets from AWS Secrets Manager
+        run: |
+          SECRETS=$(aws secretsmanager get-secret-value \
+            --secret-id ${{ env.SECRETS_MANAGER_ID }} \
+            --region ${{ env.REGION }} \
+            --query SecretString \
+            --output text)
+          echo "$SECRETS" | jq -r 'to_entries[] | "\(.key)=\(.value)"' > /tmp/env-vars.txt
+          echo "SECRETS_FETCHED=true" >> $GITHUB_ENV
+
+      - name: Build SSM parameters for deployment
+        run: |
+          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest"
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          {
+            "commands": [
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always -p 80:$CONTAINER_PORT --name app $IMAGE_URI"
+            ]
+          }
+          SSMPARAMS
+          echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy to EC2 via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ env.INSTANCE_ID }}" \
+            --region "${{ env.REGION }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for i in $(seq 1 15); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ env.INSTANCE_ID }}" \
+              --region "${{ env.REGION }}" \
+              --details \
+              --query "CommandInvocations[0].Status" \
+              --output text)
+            if [ "$STATUS" = "Success" ]; then
+              echo "SSM command succeeded."
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "SSM command failed with status: $STATUS"
+              aws ssm list-command-invocations \
+                --command-id "$COMMAND_ID" \
+                --instance-id "${{ env.INSTANCE_ID }}" \
+                --region "${{ env.REGION }}" \
+                --details \
+                --query "CommandInvocations[0].CommandPlugins[0].Output" \
+                --output text
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.PUBLIC_URL }}/api/health || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed (HTTP $HTTP_CODE)"
+              curl -s ${{ env.PUBLIC_URL }}/api/health | python -m json.tool
+              exit 0
+            fi
+            echo "Health check attempt $i/12 returned HTTP $HTTP_CODE — retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after 12 attempts"
+          exit 1
