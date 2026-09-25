@@ -1,0 +1,169 @@
+name: Deploy MCPier to EC2 (Docker)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  REGION: ap-south-1
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: mcpier
+  INSTANCE_ID: i-02ada14feb47b555c
+  PUBLIC_URL: http://3.6.254.170
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Backend diagnostics ----
+      - name: Check backend project structure
+        working-directory: backend
+        run: |
+          echo "=== Backend Structure ==="
+          ls -la
+          echo "--- pyproject.toml ---"
+          cat pyproject.toml
+          echo "--- src/main.py (routing check) ---"
+          head -30 src/main.py 2>/dev/null || echo "src/main.py not found"
+
+      - name: Verify backend Python dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install and lint backend
+        working-directory: backend
+        run: |
+          pip install hatchling
+          pip install -e . 2>&1 | tail -5 || echo "Install warnings above"
+          python -c "from src.main import app; print('FastAPI app loaded, routers:', [r.path for r in app.routes])"
+
+      # ---- Frontend diagnostics ----
+      - name: Check frontend project structure
+        working-directory: frontend
+        run: |
+          echo "=== Frontend Structure ==="
+          ls -la
+          echo "--- package.json ---"
+          cat package.json
+
+      - name: Install frontend dependencies
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build 2>&1 | tail -10
+
+      # ---- Build Docker image ----
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$REGION" | \
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Build and push Docker image
+        id: build-image
+        run: |
+          IMAGE_TAG="${{ github.sha }}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker build -t "$FULL_IMAGE:$IMAGE_TAG" -t "$FULL_IMAGE:latest" .
+          docker push "$FULL_IMAGE:$IMAGE_TAG"
+          docker push "$FULL_IMAGE:latest"
+          echo "image=$FULL_IMAGE:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ---- Deploy to EC2 via SSM ----
+      - name: Deploy on EC2 via SSM Run Command
+        run: |
+          REGION="${{ env.REGION }}"
+          ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
+          ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
+          IMAGE_TAG="${{ github.sha }}"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          {
+            "commands": [
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker image prune -f",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+            ]
+          }
+          SSMPARAMS
+
+          sed -i "s/\$REGION/$REGION/g; s/\$ECR_REGISTRY/$ECR_REGISTRY/g; s/\$IMAGE_URI/$IMAGE_URI/g" /tmp/ssm-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command sent: $COMMAND_ID"
+
+          for i in {1..30}; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$REGION" \
+              --query "CommandInvocations[0].Status" \
+              --output text 2>/dev/null || echo "Pending")
+            echo "Deployment status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              echo "Deploy completed successfully"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "Deploy failed"
+              aws ssm list-command-invocations \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --details \
+                --query "CommandInvocations[0].CommandPlugins[0].Output" \
+                --output text
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # ---- Health check ----
+      - name: Wait for container startup
+        run: sleep 15
+
+      - name: Verify deployment (HTTP 200)
+        run: |
+          echo "Checking health on $PUBLIC_URL/api/health"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/api/health" || echo "000")
+          echo "HTTP status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Health check failed (expected 200, got $HTTP_STATUS)"
+            curl -v "$PUBLIC_URL/api/health" 2>&1 || true
+            exit 1
+          fi
+          echo "Deployment verified: healthy"
+
+      - name: Final status
+        run: |
+          echo "============================================"
+          echo "Deploy successful to $PUBLIC_URL"
+          echo "Image: $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          echo "Instance: $INSTANCE_ID"
+          echo "============================================"
