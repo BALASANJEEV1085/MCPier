@@ -1,27 +1,23 @@
-name: Build, Deploy and Verify
+name: Deploy to EC2 (Docker)
 
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   workflow_dispatch:
 
 env:
   AWS_REGION: ap-south-1
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: mcpier
   INSTANCE_ID: i-02ada14feb47b555c
   PUBLIC_URL: http://3.6.254.170
-  SECRETS_MANAGER_ID: deptic/MCPier/secrets
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  SECRET_ID: deptic/MCPier/secrets
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,118 +32,102 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install backend dependencies
+      - name: Build backend
         run: |
           cd backend
-          pip install hatchling
           pip install -e .
-
-      - name: Build backend diagnostics
-        run: |
-          cd backend
-          python -c "import fastapi; print('FastAPI version:', fastapi.__version__)"
-          python -c "import sqlalchemy; print('SQLAlchemy version:', sqlalchemy.__version__)"
-
-      - name: Install frontend dependencies
-        run: |
-          cd frontend
-          npm ci
+          python -c "from src.main import app; print('Backend imports OK')"
 
       - name: Build frontend
         run: |
           cd frontend
+          npm install
           npm run build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Amazon ECR
+      - name: Log in to Amazon ECR
         run: |
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+          aws configure set region "$AWS_REGION"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Build and tag Docker image
+      - name: Build and push Docker image
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          IMAGE_TAG="${SHORT_SHA}-$(date +%s)"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          IMAGE_TAG="${{ github.sha }}"
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -f Dockerfile .
+          docker tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
-      - name: Push Docker image to ECR
+      - name: Fetch secrets and deploy on EC2
         run: |
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
-      - name: Retrieve secrets from AWS Secrets Manager
-        run: |
-          SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRETS_MANAGER_ID" --region "$AWS_REGION" --query SecretString --output text)
-          echo "$SECRETS_JSON" > /tmp/secrets.json
-          echo "DATABASE_URL=$(echo $SECRETS_JSON | python3 -c 'import json,sys; print(json.load(sys.stdin).get("DATABASE_URL",""))')" >> $GITHUB_ENV
-          echo "SECRET_KEY=$(echo $SECRETS_JSON | python3 -c 'import json,sys; print(json.load(sys.stdin).get("SECRET_KEY",""))')" >> $GITHUB_ENV
-          echo "CORS_ORIGINS=$(echo $SECRETS_JSON | python3 -c 'import json,sys; print(json.load(sys.stdin).get("CORS_ORIGINS","http://localhost:3000"))')" >> $GITHUB_ENV
+          # Fetch secrets from AWS Secrets Manager
+          SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$AWS_REGION" --query SecretString --output text)
 
-      - name: Deploy to EC2 via SSM
-        env:
-          IMAGE_URI: "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
-          REGION: "${{ env.AWS_REGION }}"
-          INSTANCE_ID: "${{ env.INSTANCE_ID }}"
-          DATABASE_URL: "${{ env.DATABASE_URL }}"
-          SECRET_KEY: "${{ env.SECRET_KEY }}"
-          CORS_ORIGINS: "${{ env.CORS_ORIGINS }}"
-        run: |
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-
+          # Build the SSM command payload with environment variables from secrets
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $FULL_IMAGE",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mcpier:latest",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app \
-                -e DATABASE_URL=$DATABASE_URL \
-                -e SECRET_KEY=$SECRET_KEY \
-                -e CORS_ORIGINS=$CORS_ORIGINS \
-                $FULL_IMAGE"
+              "export DATABASE_URL=$(echo '$SECRETS_JSON' | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"DATABASE_URL\",\"\"))')",
+              "export SECRET_KEY=$(echo '$SECRETS_JSON' | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"SECRET_KEY\",\"change-me-in-production\"))')",
+              "export CORS_ORIGINS=$(echo '$SECRETS_JSON' | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"CORS_ORIGINS\",\"http://3.6.254.170\"))')",
+              "docker run -d --restart always -p 80:80 --name app -e DATABASE_URL=\"$DATABASE_URL\" -e SECRET_KEY=\"$SECRET_KEY\" -e CORS_ORIGINS=\"$CORS_ORIGINS\" 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mcpier:latest"
             ]
           }
           SSMPARAMS
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --region "$REGION" \
+            --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" \
             --output text)
 
-          echo "SSM command ID: $COMMAND_ID"
-
+          echo "SSM Command ID: $COMMAND_ID"
+          
           # Wait for command to complete
-          for i in {1..12}; do
+          for i in $(seq 1 30); do
             STATUS=$(aws ssm list-command-invocations \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
-              --region "$REGION" \
+              --region "$AWS_REGION" \
               --query "CommandInvocations[0].Status" \
               --output text)
-            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
               break
             fi
-            echo "Waiting for SSM command... attempt $i"
-            sleep 10
+            sleep 5
           done
+
+          # Get command output
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "StandardOutputContent" \
+            --output text
 
       - name: Health check
         run: |
-          echo "Waiting for service to become available..."
-          for i in {1..12}; do
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $PUBLIC_URL/api/health || echo "000")
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "Health check passed! Service is running at $PUBLIC_URL"
+          echo "Waiting for service to be ready..."
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/api/health" || true)
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed (HTTP 200)"
               exit 0
             fi
-            echo "Attempt $i: HTTP status $HTTP_STATUS, retrying in 10 seconds..."
+            echo "Attempt $i: Got HTTP $HTTP_CODE, retrying..."
             sleep 10
           done
-          echo "Health check failed after all retries"
+          echo "Health check failed after 120 seconds"
           exit 1
