@@ -11,7 +11,7 @@ env:
   INSTANCE_ID: i-0e954e50a320672e2
   SERVER_NAME: mcpier-server
   PUBLIC_IP: 13.204.51.212
-  TARGET_PORT: 8000
+  TARGET_PORT: 80
   DOCKERFILE_PATH: .
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
           set -e
           FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
           echo "Building $FULL_IMAGE:latest from context: ."
-          docker build --build-arg NEXT_PUBLIC_API_URL="http://localhost:3000/" --tag "$FULL_IMAGE:$GITHUB_SHA" --tag "$FULL_IMAGE:latest" .
+          docker build --tag "$FULL_IMAGE:$GITHUB_SHA" --tag "$FULL_IMAGE:latest" .
           docker push "$FULL_IMAGE:$GITHUB_SHA"
           docker push "$FULL_IMAGE:latest"
           echo "full_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
@@ -183,7 +183,7 @@ jobs:
           echo "==> Verifying live service health on public endpoint..."
           # Use literal env vars from workflow env (no ${ env.VAR } in job env block!)
           PROBE_HOST="$${PUBLIC_IP:-13.204.51.212}"
-          TARGET_PORT="$${TARGET_PORT:-8000}"
+          TARGET_PORT="$${TARGET_PORT:-80}"
           if [ -z "$PROBE_HOST" ] || [ "$PROBE_HOST" = "None" ]; then
             echo "==> No public IP or domain configured; skipping external HTTP probe."
             exit 0
